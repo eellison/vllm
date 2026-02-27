@@ -69,6 +69,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from vllm.v1.attention.backends.utils import allocate_output_with_cudagraph_zeroing
 
 from .interfaces import (
     HasInnerState,
@@ -175,12 +176,15 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        # Note: kernel only writes to actual tokens, not padded rows.
+        # In CUDAGraph mode, we zero only the padding region [prev_bucket:curr_bucket]
+        # instead of the entire tensor for efficiency.
+        # See discussions in https://github.com/vllm-project/vllm/pull/28182
+        core_attn_out = allocate_output_with_cudagraph_zeroing(
+            shape=(num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
+            token_dim=0,
         )
 
         torch.ops.vllm.gdn_attention_core(

@@ -18,6 +18,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.utils import allocate_output_with_cudagraph_zeroing
 
 from .fla.ops.kda import (
     FusedRMSNormGated,
@@ -265,10 +266,11 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
 
-        core_attn_out = torch.zeros(
-            (1, num_tokens, self.local_num_heads, self.head_dim),
+        core_attn_out = allocate_output_with_cudagraph_zeroing(
+            shape=(1, num_tokens, self.local_num_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
+            token_dim=1,
         )
         torch.ops.vllm.kda_attention(
             q,

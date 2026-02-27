@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import bisect
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, make_dataclass
@@ -15,7 +16,7 @@ import numpy as np
 import torch
 from typing_extensions import runtime_checkable
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
@@ -27,6 +28,7 @@ import vllm.envs as envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     get_kv_connector_cache_layout,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import (
@@ -42,6 +44,66 @@ KVCacheLayoutType = Literal["NHD", "HND"]
 _KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None
 
 PAD_SLOT_ID = -1
+
+
+def _get_prev_cudagraph_bucket(curr_bucket: int, capture_sizes: list[int]) -> int:
+    """Find largest capture size < curr_bucket, or 0 if none. O(log n)."""
+    idx = bisect.bisect_left(capture_sizes, curr_bucket)
+    return capture_sizes[idx - 1] if idx > 0 else 0
+
+
+def allocate_output_with_cudagraph_zeroing(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    token_dim: int = 0,
+) -> torch.Tensor:
+    """
+    Allocate output tensor, zeroing only the cudagraph padding region.
+
+    In CUDAGraph mode, some kernels only write to actual tokens, leaving
+    garbage in padded rows. Instead of zeroing the entire tensor with
+    torch.zeros(), we use torch.empty() and only zero [prev_bucket:curr_bucket]
+    which is the "danger zone" where garbage could appear.
+
+    Both bucket values are static (from cudagraph_capture_sizes), so this is
+    CUDAGraph-safe - the slice indices don't change between graph replays.
+
+    In eager mode, kernels typically write all rows, so torch.empty() suffices.
+
+    Args:
+        shape: Output tensor shape
+        dtype: Output tensor dtype
+        device: Output tensor device
+        token_dim: Which dimension contains the token/sequence axis (0 or 1)
+
+    Returns:
+        Allocated tensor with appropriate zeroing
+    """
+    forward_ctx = get_forward_context()
+
+    if (forward_ctx.cudagraph_runtime_mode != CUDAGraphMode.NONE
+            and forward_ctx.batch_descriptor is not None):
+        curr_bucket = forward_ctx.batch_descriptor.num_tokens
+        compilation_config = get_current_vllm_config().compilation_config
+        capture_sizes = compilation_config.cudagraph_capture_sizes
+        prev_bucket = _get_prev_cudagraph_bucket(curr_bucket, capture_sizes)
+
+        # If bucket can only hold 1 more token than prev (e.g., buckets 1, 2),
+        # it must be fully filled - no padding possible, skip zeroing
+        if curr_bucket - prev_bucket <= 1:
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        out = torch.empty(shape, dtype=dtype, device=device)
+        if token_dim == 0:
+            out[prev_bucket:curr_bucket].zero_()
+        elif token_dim == 1:
+            out[:, prev_bucket:curr_bucket].zero_()
+        else:
+            raise ValueError(f"Unsupported token_dim: {token_dim}")
+        return out
+    else:
+        return torch.empty(shape, dtype=dtype, device=device)
 
 
 def is_valid_kv_cache_layout(value: str) -> bool:
