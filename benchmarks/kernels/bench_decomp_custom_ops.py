@@ -18,6 +18,8 @@ Section 3 — INT8 inline_asm ablation:
 Usage:
     python benchmarks/kernels/bench_decomp_custom_ops.py
     python benchmarks/kernels/bench_decomp_custom_ops.py --m 2048 --n 7168
+    python benchmarks/kernels/bench_decomp_custom_ops.py --sweep
+    python benchmarks/kernels/bench_decomp_custom_ops.py --sweep --csv results.csv
     python benchmarks/kernels/bench_decomp_custom_ops.py --verify
     python benchmarks/kernels/bench_decomp_custom_ops.py --no-compile
 """
@@ -25,6 +27,7 @@ Usage:
 import argparse
 import csv
 import io
+import math
 from typing import Any
 
 import torch
@@ -92,7 +95,7 @@ def verify(name, fn_a, fn_b, inputs, atol=0.05, rtol=0.05):
 
 
 def compile_fn(fn):
-    compiled = torch.compile(fn, mode="max-autotune-no-cudagraphs")
+    compiled = torch.compile(fn)
     return compiled
 
 
@@ -358,56 +361,45 @@ def make_rmsnorm_dynamic_int8(N, dtype, device):
 # Main
 # ============================================================================
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--m", type=int, default=512)
-    parser.add_argument("--n", type=int, default=4096)
-    parser.add_argument("--verify", action="store_true")
-    parser.add_argument("--no-compile", action="store_true",
-                        help="Benchmark eager decomposition (no Inductor)")
-    parser.add_argument("--asm-ablation", action="store_true",
-                        help="Compare INT8 inline_asm vs round+clamp fallback")
-    parser.add_argument("--csv", type=str, default=None,
-                        help="Write results to CSV file")
-    parser.add_argument("--warmup", type=int, default=25)
-    parser.add_argument("--rep", type=int, default=100)
-    args = parser.parse_args()
+SWEEP_SHAPES = [
+    (1, 4096),
+    (4, 4096),
+    (32, 4096),
+    (128, 4096),
+    (512, 4096),
+    (2048, 4096),
+    (512, 8192),
+    (512, 14336),
+]
 
-    M, N = args.m, args.n
+
+def bench_shape(M, N, args, gpu_name):
+    """Benchmark all ops at a single (M, N) shape. Returns list of CSV rows."""
     dtype = torch.bfloat16
     device = "cuda"
-    gpu_name = torch.cuda.get_device_name()
-
-    print("vLLM CustomOp Decomposition Benchmark")
-    print(f"Shape: [{M}, {N}], dtype={dtype}")
-    print(f"Device: {gpu_name}")
-    print(f"PyTorch: {torch.__version__}")
-    print(f"Mode: {'compiled' if not args.no_compile else 'eager'}")
-    print("=" * 80)
-
-    # Collect all results for CSV
-    csv_rows: list[dict[str, str]] = []
-
     scale = torch.tensor([0.1], dtype=torch.float32, device=device)
+    csv_rows: list[dict[str, str]] = []
+    shape_str = f"[{M},{N}]"
 
-    # ========================================================================
+    print(f"\n{'='*80}")
+    print(f"  Shape: [{M}, {N}]")
+    print(f"{'='*80}")
+
+    # ====================================================================
     # Section 1: Individual ops
-    # ========================================================================
-    print("\n--- Individual Ops: forward_cuda vs "
-          f"{'compiled ' if not args.no_compile else ''}forward_native ---")
+    # ====================================================================
+    print(f"\n--- Individual Ops ---")
     print(f"{'Op':<40} {'CUDA(ms)':>10} {'Decomp(ms)':>10} {'Speedup':>10}")
     print("-" * 80)
 
     individual_ops: list[tuple[str, Any, Any, Any]] = []
 
-    # RMSNorm
     cuda_fn, native_fn = make_rmsnorm(N, dtype, device)
     individual_ops.append((
         "rms_norm", cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device),),
     ))
 
-    # FusedAddRMSNorm
     cuda_fn, native_fn = make_fused_add_rmsnorm(N, dtype, device)
     individual_ops.append((
         "fused_add_rms_norm", cuda_fn, native_fn,
@@ -415,42 +407,36 @@ def main():
                  torch.randn(M, N, dtype=dtype, device=device)),
     ))
 
-    # Static FP8
     cuda_fn, native_fn = make_static_fp8_quant(device)
     individual_ops.append((
         "static_fp8_quant", cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device), scale),
     ))
 
-    # Dynamic FP8 per-tensor
     cuda_fn, native_fn = make_dynamic_fp8_quant_per_tensor(device)
     individual_ops.append((
         "dynamic_fp8_quant_per_tensor", cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device),),
     ))
 
-    # Dynamic FP8 per-token
     cuda_fn, native_fn = make_dynamic_fp8_quant_per_token(device)
     individual_ops.append((
         "dynamic_fp8_quant_per_token", cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device),),
     ))
 
-    # SiluAndMul
     cuda_fn, native_fn = make_silu_and_mul(device)
     individual_ops.append((
         "silu_and_mul", cuda_fn, native_fn,
         lambda: (torch.randn(M, 2 * N, dtype=dtype, device=device),),
     ))
 
-    # Static INT8
     cuda_fn, native_fn = make_static_int8_quant(device)
     individual_ops.append((
         "static_int8_quant", cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device), scale),
     ))
 
-    # Dynamic INT8 per-token
     cuda_fn, native_fn = make_dynamic_int8_quant(device)
     individual_ops.append((
         "dynamic_int8_quant", cuda_fn, native_fn,
@@ -468,9 +454,15 @@ def main():
         if args.no_compile:
             native_ms = bench(native_fn, inputs, args.warmup, args.rep)
         else:
-            compiled = compile_fn(native_fn)
-            warmup_compile(compiled, inputs)
-            native_ms = bench(compiled, inputs, args.warmup, args.rep)
+            # Run multiple compile trials to filter autotune noise
+            best_ms = float("inf")
+            for _ in range(args.trials):
+                torch._dynamo.reset()
+                compiled = compile_fn(native_fn)
+                warmup_compile(compiled, inputs)
+                ms = bench(compiled, inputs, args.warmup, args.rep)
+                best_ms = min(best_ms, ms)
+            native_ms = best_ms
 
         speedup = cuda_ms / native_ms
         marker = " << decomp wins" if speedup > 1.05 else ""
@@ -483,29 +475,33 @@ def main():
             "decomp_ms": f"{native_ms:.4f}",
             "speedup": f"{speedup:.2f}",
             "gpu": gpu_name,
-            "shape": f"[{M},{N}]",
+            "shape": shape_str,
         })
 
-    # ========================================================================
+    indiv_speedups = [
+        float(r["speedup"]) for r in csv_rows
+        if r["section"] == "individual" and r["shape"] == shape_str
+    ]
+    if indiv_speedups:
+        gm = math.exp(sum(math.log(s) for s in indiv_speedups) / len(indiv_speedups))
+        print(f"{'GEOMEAN':<40} {'':>10} {'':>10} {gm:>9.2f}x")
+
+    # ====================================================================
     # Section 2: Fused patterns
-    # ========================================================================
-    print(f"\n--- Fused Patterns: fused CUDA kernel vs "
-          f"{'compiled ' if not args.no_compile else ''}composed "
-          f"forward_native ---")
+    # ====================================================================
+    print(f"\n--- Fused Patterns ---")
     print(f"{'Pattern':<40} {'CUDA(ms)':>10} {'Decomp(ms)':>10}"
           f" {'Speedup':>10}")
     print("-" * 80)
 
     fused_ops: list[tuple[str, Any, Any, Any]] = []
 
-    # RMSNorm + static FP8
     cuda_fn, native_fn, label = make_rmsnorm_static_fp8(N, dtype, device)
     fused_ops.append((
         label, cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device), scale),
     ))
 
-    # FusedAdd+RMSNorm + static FP8
     cuda_fn, native_fn, label = make_fused_add_rmsnorm_static_fp8(
         N, dtype, device)
     fused_ops.append((
@@ -514,7 +510,6 @@ def main():
                  torch.randn(M, N, dtype=dtype, device=device), scale),
     ))
 
-    # RMSNorm + dynamic per-token FP8
     cuda_fn, native_fn, label = make_rmsnorm_dynamic_per_token_fp8(
         N, dtype, device)
     fused_ops.append((
@@ -522,21 +517,18 @@ def main():
         lambda: (torch.randn(M, N, dtype=dtype, device=device),),
     ))
 
-    # SiluAndMul + static FP8
     cuda_fn, native_fn, label = make_silu_and_mul_static_fp8(N, dtype, device)
     fused_ops.append((
         label, cuda_fn, native_fn,
         lambda: (torch.randn(M, 2 * N, dtype=dtype, device=device), scale),
     ))
 
-    # RMSNorm + static INT8
     cuda_fn, native_fn, label = make_rmsnorm_static_int8(N, dtype, device)
     fused_ops.append((
         label, cuda_fn, native_fn,
         lambda: (torch.randn(M, N, dtype=dtype, device=device), scale),
     ))
 
-    # SiluAndMul + static INT8
     cuda_fn, native_fn, label = make_silu_and_mul_static_int8(
         N, dtype, device)
     fused_ops.append((
@@ -544,7 +536,6 @@ def main():
         lambda: (torch.randn(M, 2 * N, dtype=dtype, device=device), scale),
     ))
 
-    # RMSNorm + dynamic INT8
     cuda_fn, native_fn, label = make_rmsnorm_dynamic_int8(N, dtype, device)
     fused_ops.append((
         label, cuda_fn, native_fn,
@@ -560,9 +551,14 @@ def main():
         if args.no_compile:
             native_ms = bench(native_fn, inputs, args.warmup, args.rep)
         else:
-            compiled = compile_fn(native_fn)
-            warmup_compile(compiled, inputs)
-            native_ms = bench(compiled, inputs, args.warmup, args.rep)
+            best_ms = float("inf")
+            for _ in range(args.trials):
+                torch._dynamo.reset()
+                compiled = compile_fn(native_fn)
+                warmup_compile(compiled, inputs)
+                ms = bench(compiled, inputs, args.warmup, args.rep)
+                best_ms = min(best_ms, ms)
+            native_ms = best_ms
 
         speedup = cuda_ms / native_ms
         marker = " << decomp wins" if speedup > 1.05 else ""
@@ -575,40 +571,126 @@ def main():
             "decomp_ms": f"{native_ms:.4f}",
             "speedup": f"{speedup:.2f}",
             "gpu": gpu_name,
-            "shape": f"[{M},{N}]",
+            "shape": shape_str,
         })
 
-    # ========================================================================
-    # Section 3: INT8 inline_asm ablation (optional)
-    # ========================================================================
+    fused_speedups = [
+        float(r["speedup"]) for r in csv_rows
+        if r["section"] == "fused" and r["shape"] == shape_str
+    ]
+    if fused_speedups:
+        gm = math.exp(sum(math.log(s) for s in fused_speedups) / len(fused_speedups))
+        print(f"{'GEOMEAN':<40} {'':>10} {'':>10} {gm:>9.2f}x")
+
+    return csv_rows
+
+
+def write_csv(csv_rows, csv_path, shapes):
+    """Write pivoted CSV: one row per op, columns are shapes (speedup values).
+
+    Also includes cuda_ms and decomp_ms for each shape so users can inspect
+    absolute timings.
+    """
+    if not csv_rows:
+        return
+
+    # Collect unique shape strings in order
+    shape_strs = [f"[{m},{n}]" for m, n in shapes]
+
+    # Group rows by (section, op)
+    from collections import OrderedDict
+    grouped: dict[tuple[str, str], dict[str, dict]] = OrderedDict()
+    for row in csv_rows:
+        key = (row["section"], row["op"])
+        if key not in grouped:
+            grouped[key] = {}
+        grouped[key][row["shape"]] = row
+
+    # Build pivoted CSV
+    buf = io.StringIO()
+    # Header: section, op, geomean_speedup, then per-shape columns
+    header = ["section", "op", "geomean_speedup"]
+    for s in shape_strs:
+        header.extend([f"{s}_speedup", f"{s}_cuda_ms", f"{s}_decomp_ms"])
+    writer = csv.writer(buf)
+    writer.writerow(header)
+
+    for (section, op), by_shape in grouped.items():
+        # Compute geomean of speedups across shapes
+        speedups = []
+        for s in shape_strs:
+            if s in by_shape and by_shape[s]["speedup"]:
+                speedups.append(float(by_shape[s]["speedup"]))
+        geomean = (
+            math.exp(sum(math.log(s) for s in speedups) / len(speedups))
+            if speedups else 0.0
+        )
+
+        row = [section, op, f"{geomean:.2f}"]
+        for s in shape_strs:
+            if s in by_shape:
+                row.extend([
+                    by_shape[s]["speedup"],
+                    by_shape[s]["cuda_ms"],
+                    by_shape[s]["decomp_ms"],
+                ])
+            else:
+                row.extend(["", "", ""])
+        writer.writerow(row)
+
+    csv_text = buf.getvalue()
+
+    if csv_path:
+        with open(csv_path, "w") as f:
+            f.write(csv_text)
+        print(f"\nCSV written to {csv_path}")
+    else:
+        print(f"\n--- CSV ---")
+        print(csv_text, end="")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--m", type=int, default=512)
+    parser.add_argument("--n", type=int, default=4096)
+    parser.add_argument("--sweep", action="store_true",
+                        help="Sweep standard shapes: 1..2048 tokens, "
+                             "4096..14336 hidden")
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Benchmark eager decomposition (no Inductor)")
+    parser.add_argument("--asm-ablation", action="store_true",
+                        help="Compare INT8 inline_asm vs round+clamp fallback")
+    parser.add_argument("--csv", type=str, default=None,
+                        help="Write results to CSV file")
+    parser.add_argument("--warmup", type=int, default=25)
+    parser.add_argument("--rep", type=int, default=100)
+    parser.add_argument("--trials", type=int, default=1,
+                        help="Recompile N times and take best decomp time "
+                             "(filters autotune non-determinism)")
+    args = parser.parse_args()
+
+    gpu_name = torch.cuda.get_device_name()
+
+    print("vLLM CustomOp Decomposition Benchmark")
+    print(f"Device: {gpu_name}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"Mode: {'compiled' if not args.no_compile else 'eager'}")
+
+    shapes = SWEEP_SHAPES if args.sweep else [(args.m, args.n)]
+    print(f"Shapes: {shapes}")
+    print("=" * 80)
+
+    csv_rows: list[dict[str, str]] = []
+
+    for M, N in shapes:
+        csv_rows.extend(bench_shape(M, N, args, gpu_name))
+
     if args.asm_ablation:
         ablation_rows = bench_int8_inline_asm(args, gpu_name)
         csv_rows.extend(ablation_rows)
 
-    # ========================================================================
-    # Write CSV
-    # ========================================================================
-    if csv_rows:
-        fieldnames = list(csv_rows[0].keys())
-        # Check if ablation added extra fields
-        for row in csv_rows:
-            for k in row:
-                if k not in fieldnames:
-                    fieldnames.append(k)
-
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(csv_rows)
-        csv_text = buf.getvalue()
-
-        if args.csv:
-            with open(args.csv, "w") as f:
-                f.write(csv_text)
-            print(f"\nCSV written to {args.csv}")
-        else:
-            print(f"\n--- CSV ---")
-            print(csv_text, end="")
+    write_csv(csv_rows, args.csv, shapes)
 
 
 def bench_int8_inline_asm(args, gpu_name):
